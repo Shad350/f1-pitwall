@@ -1,6 +1,6 @@
 ---
-title: F1 Pit Wall Telemetry
-emoji: 🚀
+title: F1 Pitwall
+emoji: 🏎️
 colorFrom: red
 colorTo: gray
 sdk: docker
