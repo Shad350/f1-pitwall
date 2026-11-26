@@ -809,6 +809,173 @@ class F1Core:
 # ==============================================================================
 # MODULE 2: Flask Server & F1 TV Pro / Pit Wall Broadcast Interface
 # ==============================================================================
+# === 512MB & 1950-2026 AUTHENTIC CIRCUIT ENGINE ===
+import gc as _gc, urllib.request as _ureq, json as _ujson
+_MV_CACHE = {}
+_GJ_DATA = None
+_LAST_CKEY = [None]
+
+def _is_low_mem():
+    if os.environ.get('RENDER') or os.environ.get('LOW_MEM'): return True
+    for cg in ('/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory/memory.limit_in_bytes'):
+        try:
+            if os.path.exists(cg):
+                v = open(cg).read().strip()
+                if v.isdigit() and int(v) <= 900 * 1024 * 1024: return True
+        except Exception: pass
+    return False
+
+if fastf1 is not None:
+    _orig_sload = fastf1.core.Session.load
+    def _safe_sload(self, *a, **kw):
+        _gc.collect()
+        if _is_low_mem(): kw['telemetry'] = False
+        res = _orig_sload(self, *a, **kw)
+        try: _LAST_CKEY[0] = self.session_info.get('Meeting', {}).get('Circuit', {}).get('Key')
+        except Exception: pass
+        _gc.collect()
+        return res
+    fastf1.core.Session.load = _safe_sload
+
+def _smooth_resample_track(tx, ty, n_pts=800):
+    x = np.asarray(tx, dtype=float); y = np.asarray(ty, dtype=float)
+    m = np.isfinite(x) & np.isfinite(y) & ~((np.abs(x) < 1e-3) & (np.abs(y) < 1e-3))
+    x, y = x[m], y[m]
+    if len(x) < 6: return list(tx), list(ty)
+    keep = [0]
+    for i in range(1, len(x)):
+        if math.hypot(x[i]-x[keep[-1]], y[i]-y[keep[-1]]) > 0.5: keep.append(i)
+    x, y = x[keep], y[keep]
+    if math.hypot(x[-1]-x[0], y[-1]-y[0]) < 1.0: x, y = x[:-1], y[:-1]
+    N = len(x)
+    if N < 350:
+        sx, sy = [], []
+        steps = max(4, min(12, 700 // max(1, N)))
+        for i in range(N):
+            p0x, p0y = x[(i-1)%N], y[(i-1)%N]
+            p1x, p1y = x[i], y[i]
+            p2x, p2y = x[(i+1)%N], y[(i+1)%N]
+            p3x, p3y = x[(i+2)%N], y[(i+2)%N]
+            for st in range(steps):
+                t = st / float(steps); t2 = t*t; t3 = t2*t
+                cx = 0.5*((2*p1x)+(-p0x+p2x)*t+(2*p0x-5*p1x+4*p2x-p3x)*t2+(-p0x+3*p1x-3*p2x+p3x)*t3)
+                cy = 0.5*((2*p1y)+(-p0y+p2y)*t+(2*p0y-5*p1y+4*p2y-p3y)*t2+(-p0y+3*p1y-3*p2y+p3y)*t3)
+                sx.append(cx); sy.append(cy)
+        x, y = np.asarray(sx), np.asarray(sy)
+    x = np.append(x, x[0]); y = np.append(y, y[0])
+    ds = np.hypot(np.diff(x), np.diff(y))
+    s_cum = np.concatenate(([0.0], np.cumsum(ds)))
+    if s_cum[-1] <= 0: return list(tx), list(ty)
+    tgt = np.linspace(0.0, s_cum[-1], n_pts, endpoint=False)
+    rx = np.interp(tgt, s_cum, x); ry = np.interp(tgt, s_cum, y)
+    rx = np.append(rx, rx[0]); ry = np.append(ry, ry[0])
+    return [round(float(v), 1) for v in rx], [round(float(v), 1) for v in ry]
+
+def _detect_corners(tx, ty):
+    x = np.asarray(tx[:-1], dtype=float); y = np.asarray(ty[:-1], dtype=float)
+    N = len(x)
+    if N < 60: return []
+    w = max(4, N // 80)
+    ang = np.zeros(N)
+    for i in range(N):
+        dx1, dy1 = x[i] - x[(i-w)%N], y[i] - y[(i-w)%N]
+        dx2, dy2 = x[(i+w)%N] - x[i], y[(i+w)%N] - y[i]
+        n1, n2 = math.hypot(dx1, dy1), math.hypot(dx2, dy2)
+        if n1 > 0 and n2 > 0:
+            c = max(-1.0, min(1.0, (dx1*dx2 + dy1*dy2)/(n1*n2)))
+            ang[i] = math.degrees(math.acos(c))
+    corners = []; last_i = -999; min_gap = N // 28
+    for i in range(N):
+        if ang[i] > 16.0 and i - last_i >= min_gap:
+            loc = [ang[(i+k)%N] for k in range(-w, w+1)]
+            if ang[i] >= max(loc):
+                corners.append({'num': len(corners)+1, 'letter': '', 'x': round(float(x[i]),1), 'y': round(float(y[i]),1)})
+                last_i = i
+                if len(corners) >= 24: break
+    return corners
+
+def _get_authentic_circuit(year, gp, title):
+    global _GJ_DATA
+    t_low = (str(title) + ' ' + str(gp)).lower()
+    mv_map = {'austral':10,'melbourne':10,'bahrain':63,'sakhir':63,'saudi':149,'jeddah':149,'japan':46,'suzuka':46,'chin':49,'shanghai':49,'miami':151,'emilia':6,'imola':6,'monaco':22,'canad':23,'montreal':23,'spain':15,'spanish':15,'barcelona':15,'austria':19,'spielberg':19,'brit':2,'silverstone':2,'hungar':4,'budapest':4,'belg':7,'spa':7,'dutch':55,'zandvoort':55,'ital':39,'monza':39,'azerbaijan':144,'baku':144,'singapore':61,'united states':9,'austin':9,'mexic':65,'brazil':14,'sao paulo':14,'interlagos':14,'las vegas':152,'qatar':150,'lusail':150,'abu dhabi':70,'yas':70,'portug':148,'portimao':148,'turk':54,'istanbul':54,'fran':142,'paul ricard':142,'tusc':147,'mugello':147,'eifel':20,'nurburgring':20,'german':29,'hockenheim':29,'russ':79,'sochi':79}
+    ckey = _LAST_CKEY[0]
+    if not ckey:
+        for k, v in mv_map.items():
+            if k in t_low: ckey = v; break
+    if ckey:
+        for yr in (max(2018, min(2025, int(year))), 2024, 2023):
+            mk = (ckey, yr)
+            if mk in _MV_CACHE: return _MV_CACHE[mk]
+            try:
+                req = _ureq.Request(f'https://api.multiviewer.app/api/v1/circuits/{ckey}/{yr}', headers={'User-Agent':'FastF1/3.0'})
+                with _ureq.urlopen(req, timeout=5) as r:
+                    d = _ujson.loads(r.read().decode('utf-8'))
+                mx, my = d.get('x', []), d.get('y', [])
+                if len(mx) > 50:
+                    rot = float(d.get('rotation', 0.0)) * math.pi / 180.0
+                    ca, sa = math.cos(rot), math.sin(rot)
+                    rx = [x*ca - y*sa for x, y in zip(mx, my)]
+                    ry = [x*sa + y*ca for x, y in zip(mx, my)]
+                    tx, ty = _smooth_resample_track(rx, ry, 800)
+                    crns = []
+                    for c in d.get('corners', []):
+                        tp = c.get('trackPosition', {})
+                        if 'x' in tp and 'y' in tp:
+                            cx, cy = float(tp['x']), float(tp['y'])
+                            crns.append({'num': int(c.get('number',0)), 'letter': str(c.get('letter','')), 'x': round(cx*ca - cy*sa, 1), 'y': round(cx*sa + cy*ca, 1)})
+                    out = {'x': tx, 'y': ty, 'corners': crns or _detect_corners(tx, ty)}
+                    _MV_CACHE[mk] = out; return out
+            except Exception: pass
+    try:
+        if _GJ_DATA is None:
+            req = _ureq.Request('https://raw.githubusercontent.com/bacinger/f1-circuits/master/f1-circuits.geojson', headers={'User-Agent':'F1PitWall/1.0'})
+            with _ureq.urlopen(req, timeout=8) as r: _GJ_DATA = _ujson.loads(r.read().decode('utf-8'))
+        id_map = {'adelaide':'au-1985','austral':'au-1953','melbourne':'au-1953','bahrain':'bh-2002','saudi':'sa-2021','jeddah':'sa-2021','japan':'jp-1962','suzuka':'jp-1962','fuji':'jp-1965','chin':'cn-2004','miami':'us-2022','imola':'it-1953','emilia':'it-1953','monaco':'mc-1929','canad':'ca-1978','montreal':'ca-1978','spain':'es-1991','spanish':'es-1991','jerez':'es-1986','valencia':'es-2008','austria':'at-1969','brit':'gb-1948','silverstone':'gb-1948','brands hatch':'gb-1926','hungar':'hu-1986','belg':'be-1925','spa':'be-1925','zolder':'be-1963','dutch':'nl-1948','zandvoort':'nl-1948','ital':'it-1922','monza':'it-1922','mugello':'it-1914','baku':'az-2016','azerbaijan':'az-2016','singapore':'sg-2008','austin':'us-2012','united states':'us-2012','indianapolis':'us-1909','watkins':'us-1948','mexic':'mx-1962','brazil':'br-1940','sao paulo':'br-1940','interlagos':'br-1940','las vegas':'us-2023','qatar':'qa-2004','abu dhabi':'ae-2009','malays':'my-1999','sepang':'my-1999','hockenheim':'de-1932','german':'de-1932','nurburgring':'de-1927','magny':'fr-1960','paul ricard':'fr-1969','fran':'fr-1960','estoril':'pt-1972','portug':'pt-2008','kyalami':'za-1961','south afric':'za-1961','korea':'kr-2010','india':'in-2011','turk':'tr-2005','argentin':'ar-1952'}
+        best = None
+        for k, gid in id_map.items():
+            if k in t_low:
+                for ft in _GJ_DATA.get('features', []):
+                    if ft.get('properties', {}).get('id') == gid: best = ft; break
+                if best: break
+        if not best:
+            for ft in _GJ_DATA.get('features', []):
+                pr = str(ft.get('properties', {})).lower()
+                if any(w in pr for w in t_low.split() if len(w) > 4): best = ft; break
+        if best:
+            coords = best['geometry']['coordinates']
+            if best['geometry']['type'] == 'MultiLineString': coords = max(coords, key=len)
+            lons = [c[0] for c in coords]; lats = [c[1] for c in coords]
+            mlon, mlat = sum(lons)/len(lons), sum(lats)/len(lats)
+            sx = math.cos(math.radians(mlat)) * 111320.0
+            rx = [(lon - mlon) * sx for lon in lons]; ry = [(lat - mlat) * 111320.0 for lat in lats]
+            tx, ty = _smooth_resample_track(rx, ry, 800)
+            return {'x': tx, 'y': ty, 'corners': _detect_corners(tx, ty)}
+    except Exception: pass
+    return None
+
+def _fix_payload_circuit(res, year, gp):
+    if not isinstance(res, dict) or 'circuit' not in res: return res
+    _LAST_CKEY[0] = None
+    c = res['circuit']; tx, ty = c.get('x', []), c.get('y', [])
+    has_gps = res.get('meta', {}).get('has_gps', False)
+    need_replace = (not has_gps) or (len(tx) <= 405)
+    if not need_replace and len(tx) > 10:
+        dx = np.diff(tx); dy = np.diff(ty); plen = float(np.sum(np.hypot(dx, dy)))
+        diag = math.hypot(max(tx)-min(tx), max(ty)-min(ty))
+        if diag > 0 and plen > diag * 4.2: need_replace = True
+    if need_replace:
+        auth = _get_authentic_circuit(year, gp, res.get('meta', {}).get('title', ''))
+        if auth: res['circuit'] = auth
+    else:
+        sx, sy = _smooth_resample_track(tx, ty, 800)
+        res['circuit']['x'] = sx; res['circuit']['y'] = sy
+        if not res['circuit'].get('corners'): res['circuit']['corners'] = _detect_corners(sx, sy)
+    return res
+
+_orig_lr = F1Core.load_replay
+_orig_ef = F1Core.fetch_ergast_fallback
+F1Core.load_replay = staticmethod(lambda y, g, s='R': _fix_payload_circuit(_orig_lr(y, g, s), y, g))
+F1Core.fetch_ergast_fallback = staticmethod(lambda y, g, s='R': _fix_payload_circuit(_orig_ef(y, g, s), y, g))
 app = Flask(__name__)
 F1Core.initialize()
 
